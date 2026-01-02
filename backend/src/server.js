@@ -75,6 +75,8 @@ const apiHostsRoutes = require("./routes/apiHostsRoutes");
 const releaseNotesRoutes = require("./routes/releaseNotesRoutes");
 const releaseNotesAcceptanceRoutes = require("./routes/releaseNotesAcceptanceRoutes");
 const buyMeACoffeeRoutes = require("./routes/buyMeACoffeeRoutes");
+const oidcRoutes = require("./routes/oidcRoutes");
+const { initializeOIDC } = require("./auth/oidc");
 const { initSettings } = require("./services/settingsService");
 const { queueManager } = require("./services/automation");
 const { authenticateToken, requireAdmin } = require("./middleware/auth");
@@ -369,15 +371,23 @@ app.use(
 			// Allow Bull Board requests from the same origin as CORS_ORIGIN
 			if (origin === bullBoardOrigin) return callback(null, true);
 
-			// Allow same-origin requests (e.g., Bull Board accessing its own API)
-			// This allows http://hostname:3001 to make requests to http://hostname:3001
-			if (origin?.includes(":3001")) return callback(null, true);
+			// Allow same-origin requests from backend port (localhost/127.0.0.1 only)
+			// This safely allows Bull Board to access its own API without allowing arbitrary origins
+			try {
+				const originUrl = new URL(origin);
+				const isLocalhost = originUrl.hostname === "localhost" || originUrl.hostname === "127.0.0.1";
+				const isBackendPort = originUrl.port === "3001";
+				if (isLocalhost && isBackendPort) {
+					return callback(null, true);
+				}
 
-			// Allow Bull Board requests from the frontend origin (same host, different port)
-			// This handles cases where frontend is on port 3000 and backend on 3001
-			const frontendOrigin = origin?.replace(/:3001$/, ":3000");
-			if (frontendOrigin && allowedOrigins.includes(frontendOrigin)) {
-				return callback(null, true);
+				// Allow requests from same hostname but different port (frontend on 3000, backend on 3001)
+				const corsUrl = new URL(process.env.CORS_ORIGIN || "http://localhost:3000");
+				if (originUrl.hostname === corsUrl.hostname && originUrl.port === "3001") {
+					return callback(null, true);
+				}
+			} catch (e) {
+				// Invalid URL, reject
 			}
 
 			return callback(new Error("Not allowed by CORS"));
@@ -460,6 +470,7 @@ const agentLimiter = rateLimit({
 });
 
 app.use(`/api/${apiVersion}/auth`, authLimiter, authRoutes);
+app.use(`/api/${apiVersion}/auth/oidc`, authLimiter, oidcRoutes);
 app.use(`/api/${apiVersion}/hosts`, agentLimiter, hostRoutes);
 app.use(`/api/${apiVersion}/host-groups`, hostGroupRoutes);
 app.use(`/api/${apiVersion}/packages`, packageRoutes);
@@ -547,13 +558,13 @@ app.use(`/bullboard`, async (req, res, next) => {
 				return res.status(403).json({ error: "Admin access required" });
 			}
 
-			// Set a simple auth cookie that will persist for the session
+			// Set a secure auth cookie that will persist for the session
 			res.cookie("bull-board-auth", token, {
-				httpOnly: false,
-				secure: false,
+				httpOnly: true,
+				secure: process.env.NODE_ENV === "production",
 				maxAge: 3600000, // 1 hour
 				path: "/bullboard",
-				sameSite: "lax",
+				sameSite: "strict",
 			});
 
 			console.log("Bull Board - Authentication successful, cookie set");
@@ -890,6 +901,18 @@ async function startServer() {
 
 		// Check and create default role permissions on startup
 		await checkAndCreateRolePermissions();
+
+		// Initialize OIDC if enabled
+		if (process.env.OIDC_ENABLED === "true") {
+			const oidcInitialized = await initializeOIDC();
+			if (oidcInitialized) {
+				console.log("OIDC authentication enabled and initialized");
+			} else {
+				console.warn(
+					"OIDC is enabled but failed to initialize - check configuration",
+				);
+			}
+		}
 
 		// Initialize dashboard preferences for all users
 		await initializeDashboardPreferences();
